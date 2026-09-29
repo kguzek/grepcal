@@ -73,6 +73,20 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(config.listen_address).await?;
     info!(address = %config.listen_address, "serving filtered calendars");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to listen for SIGTERM");
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.expect("failed to listen for SIGINT"),
+        _ = terminate.recv() => {},
+    }
+
+    info!("received shutdown signal");
 }
