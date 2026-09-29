@@ -52,3 +52,17 @@ pub async fn home() -> Html<String> {
          </html>"
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::home;
+
+    #[tokio::test]
+    async fn includes_product_and_build_information() {
+        let page = home().await.0;
+
+        assert!(page.contains("Like grep, but for iCal!"));
+        assert!(page.contains("https://git.guzek.uk/kguzek/grepcal"));
+        assert!(page.contains(env!("GREPCAL_REVISION")));
+    }
+}
