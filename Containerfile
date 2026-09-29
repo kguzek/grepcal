@@ -1,5 +1,7 @@
 FROM rust:1.97-alpine3.21 AS builder
 
+ARG GREPCAL_REVISION
+
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* build.rs ./
 COPY src ./src

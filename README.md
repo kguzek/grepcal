@@ -27,8 +27,10 @@ The service preserves the input bytes for all retained calendar components, incl
 Build the static scratch image:
 
 ```sh
-podman build -t grepcal .
+make container-build
 ```
+
+The Makefile resolves the revision on the host and passes it into Compose, so the container build context does not need `.git`.
 
 Run it with a private configuration mounted read-only:
 

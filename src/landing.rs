@@ -1,6 +1,7 @@
 use axum::response::Html;
 
 const SERVER_REVISION: &str = env!("GREPCAL_REVISION");
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPOSITORY_URL: &str = "https://git.guzek.uk/kguzek/grepcal";
 const FORGEJO_LOGO_URL: &str = "https://git.guzek.uk/assets/img/logo.svg";
 
@@ -46,7 +47,7 @@ pub async fn home() -> Html<String> {
          </span>\
          <span class=\"repo-url\">git.guzek.uk/kguzek/grepcal</span>\
          </a>\
-         <footer>Server revision: <code>{SERVER_REVISION}</code></footer>\
+         <footer>Server revision: <code>v{SERVER_VERSION} ({SERVER_REVISION})</code></footer>\
          </main>\
          </body>\
          </html>"
@@ -55,7 +56,7 @@ pub async fn home() -> Html<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::home;
+    use super::{home, SERVER_REVISION, SERVER_VERSION};
 
     #[tokio::test]
     async fn includes_product_and_build_information() {
@@ -63,6 +64,9 @@ mod tests {
 
         assert!(page.contains("Like grep, but for iCal!"));
         assert!(page.contains("https://git.guzek.uk/kguzek/grepcal"));
-        assert!(page.contains(env!("GREPCAL_REVISION")));
+        assert!(page.contains(&format!(
+            "Server revision: <code>v{} ({})</code>",
+            SERVER_VERSION, SERVER_REVISION
+        )));
     }
 }
