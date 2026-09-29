@@ -1,0 +1,15 @@
+# Copy to config.toml and replace source_url with the private feed URL.
+source_url = "https://calendar.example.com/private-feed.ics"
+listen_address = "0.0.0.0:8080"
+refresh_seconds = 300
+cache_max_age_seconds = 60
+
+# Rules are applied in order. The last matching rule wins; events without a
+# SUMMARY are retained. Rust regular expressions support inline flags, e.g. (?i).
+[[filters]]
+pattern = "(?i)standup|focus time"
+action = "exclude"
+
+[[filters]]
+pattern = "(?i)^project alpha"
+action = "include"
