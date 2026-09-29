@@ -2,7 +2,7 @@
 
 > Like grep, but for iCal
 
-Fetches one iCalendar feed, filters `VEVENT`s by `SUMMARY`, and serves the cached result at `/calendar.ics`.
+Fetches multiple iCalendar feeds, filters `VEVENT`s by `SUMMARY`, and serves each cached result at `/{slug}.ics`.
 
 ## Local use
 
@@ -12,7 +12,9 @@ Copy `config.example.toml` to `config.toml` and change its filters, then run:
 cargo run -- config.toml
 ```
 
-The feed is available at `http://127.0.0.1:8080/calendar.ics`. There is also a health check available at `/health`.
+Each `[[calendars]]` entry needs a unique `slug`, `source_url`, `refresh_seconds`, and `cache_max_age_seconds`; its `[[calendars.filters]]` rules apply only to that feed. For example, `slug = "my-cal"` is available at `http://127.0.0.1:8080/my-cal.ics`.
+
+`/health` returns JSON with the current ISO 8601 UTC timestamp and floating-point uptime in seconds. It returns `200 OK` when every calendar is refreshing successfully, or `502 Bad Gateway` and a `failed_calendars` list when one or more sources are unavailable. The server still starts in the latter case and retries each source independently.
 
 ## Rules
 

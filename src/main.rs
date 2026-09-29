@@ -1,33 +1,44 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
     io::{BufReader, Cursor},
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+    response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
 use bytes::Bytes;
+use chrono::{SecondsFormat, Utc};
 use ical::IcalParser;
 use regex::Regex;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{sync::RwLock, time};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
-    source_url: String,
     listen_address: SocketAddr,
+    calendars: Vec<CalendarConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalendarConfig {
+    slug: String,
+    source_url: String,
     refresh_seconds: u64,
     cache_max_age_seconds: u64,
     #[serde(default)]
@@ -57,9 +68,30 @@ struct Snapshot {
     etag: HeaderValue,
 }
 
-struct AppState {
-    snapshot: RwLock<Snapshot>,
+struct CalendarState {
+    snapshot: RwLock<Option<Snapshot>>,
     cache_control: HeaderValue,
+    last_error: RwLock<Option<String>>,
+}
+
+struct AppState {
+    calendars: HashMap<String, Arc<CalendarState>>,
+    started_at: Instant,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    message: &'static str,
+    status: &'static str,
+    uptime: f64,
+    date: String,
+    failed_calendars: Vec<FailedCalendar>,
+}
+
+#[derive(Serialize)]
+struct FailedCalendar {
+    slug: String,
+    error: String,
 }
 
 #[tokio::main]
@@ -76,37 +108,77 @@ async fn main() -> Result<()> {
             .with_context(|| format!("could not read configuration from {config_path}"))?,
     )
     .with_context(|| format!("could not parse configuration from {config_path}"))?;
-    let filters = compile_filters(config.filters)?;
-    let client = Client::builder()
-        .user_agent("grepcal/0.1")
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    validate_config(&config)?;
+    let client = Arc::new(
+        Client::builder()
+            .user_agent("grepcal/0.1")
+            .timeout(Duration::from_secs(30))
+            .build()?,
+    );
 
-    let initial = fetch_snapshot(&client, &config.source_url, &filters).await?;
+    let mut calendars = HashMap::with_capacity(config.calendars.len());
+    for calendar in config.calendars {
+        let filters = compile_filters(calendar.filters)?;
+        let calendar_state = Arc::new(CalendarState {
+            snapshot: RwLock::new(None),
+            cache_control: HeaderValue::from_str(&format!(
+                "public, max-age={}",
+                calendar.cache_max_age_seconds
+            ))?,
+            last_error: RwLock::new(Some("initial refresh has not completed".to_owned())),
+        });
+        calendars.insert(calendar.slug.clone(), Arc::clone(&calendar_state));
+        tokio::spawn(refresh_loop(
+            calendar.slug,
+            calendar_state,
+            Arc::clone(&client),
+            calendar.source_url,
+            filters,
+            Duration::from_secs(calendar.refresh_seconds),
+        ));
+    }
     let state = Arc::new(AppState {
-        snapshot: RwLock::new(initial),
-        cache_control: HeaderValue::from_str(&format!(
-            "public, max-age={}",
-            config.cache_max_age_seconds
-        ))?,
+        calendars,
+        started_at: Instant::now(),
     });
 
-    tokio::spawn(refresh_loop(
-        Arc::clone(&state),
-        client,
-        config.source_url,
-        filters,
-        Duration::from_secs(config.refresh_seconds),
-    ));
-
     let app = Router::new()
-        .route("/calendar.ics", get(calendar))
+        .route("/{calendar}", get(calendar))
         .route("/health", get(health))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(config.listen_address).await?;
-    info!(address = %config.listen_address, "serving filtered calendar");
+    info!(address = %config.listen_address, "serving filtered calendars");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    if config.calendars.is_empty() {
+        bail!("configuration must contain at least one calendar");
+    }
+
+    let mut slugs = HashSet::with_capacity(config.calendars.len());
+    for calendar in &config.calendars {
+        let valid_slug = !calendar.slug.is_empty()
+            && calendar.slug != "health"
+            && calendar
+                .slug
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        if !valid_slug {
+            bail!("invalid calendar slug: {}", calendar.slug);
+        }
+        if !slugs.insert(&calendar.slug) {
+            bail!("duplicate calendar slug: {}", calendar.slug);
+        }
+        if calendar.refresh_seconds == 0 {
+            bail!(
+                "refresh_seconds must be greater than zero for {}",
+                calendar.slug
+            );
+        }
+    }
     Ok(())
 }
 
@@ -124,25 +196,27 @@ fn compile_filters(configs: Vec<FilterConfig>) -> Result<Vec<Filter>> {
 }
 
 async fn refresh_loop(
-    state: Arc<AppState>,
-    client: Client,
+    slug: String,
+    state: Arc<CalendarState>,
+    client: Arc<Client>,
     source_url: String,
     filters: Vec<Filter>,
     interval: Duration,
 ) {
-    let mut ticker = time::interval(interval);
-    ticker.tick().await;
     loop {
-        ticker.tick().await;
         match fetch_snapshot(&client, &source_url, &filters).await {
             Ok(snapshot) => {
-                *state.snapshot.write().await = snapshot;
-                info!("refreshed calendar snapshot");
+                *state.snapshot.write().await = Some(snapshot);
+                *state.last_error.write().await = None;
+                info!(slug, "refreshed calendar snapshot");
             }
-            Err(error) => {
-                error!(%error, "calendar refresh failed; continuing to serve the last snapshot")
+            Err(refresh_error) => {
+                let error_message = refresh_error.to_string();
+                *state.last_error.write().await = Some(error_message.clone());
+                error!(slug, error = %error_message, "calendar refresh failed; continuing to serve the last snapshot")
             }
         }
+        time::sleep(interval).await;
     }
 }
 
@@ -162,8 +236,21 @@ async fn fetch_snapshot(client: &Client, source_url: &str, filters: &[Filter]) -
     })
 }
 
-async fn calendar(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+async fn calendar(
+    Path(path): Path<String>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(slug) = path.strip_suffix(".ics").filter(|slug| !slug.is_empty()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(state) = state.calendars.get(slug) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let snapshot = state.snapshot.read().await;
+    let Some(snapshot) = snapshot.as_ref() else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
         .is_some_and(|value| value == snapshot.etag);
@@ -187,8 +274,35 @@ async fn calendar(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         .expect("static response headers are valid")
 }
 
-async fn health() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, Json<HealthResponse>) {
+    let mut failed_calendars = Vec::new();
+    for (slug, calendar) in &state.calendars {
+        if let Some(error) = calendar.last_error.read().await.clone() {
+            failed_calendars.push(FailedCalendar {
+                slug: slug.clone(),
+                error,
+            });
+        }
+    }
+    failed_calendars.sort_by(|left, right| left.slug.cmp(&right.slug));
+
+    let healthy = failed_calendars.is_empty();
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    let status_text = if healthy { "200 OK" } else { "502 Bad Gateway" };
+    (
+        status,
+        Json(HealthResponse {
+            message: "Server is up",
+            status: status_text,
+            uptime: state.started_at.elapsed().as_secs_f64(),
+            date: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            failed_calendars,
+        }),
+    )
 }
 
 fn filter_calendar(source: &[u8], filters: &[Filter]) -> Result<Vec<u8>> {
@@ -294,5 +408,109 @@ mod tests {
         assert!(result.contains("SUMMARY:Keep me"));
         assert!(!result.contains("SUMMARY:Skip me"));
         assert!(result.contains("BEGIN:VTIMEZONE"));
+    }
+
+    fn calendar_config(slug: &str) -> CalendarConfig {
+        CalendarConfig {
+            slug: slug.to_owned(),
+            source_url: "https://calendar.example.com/feed.ics".to_owned(),
+            refresh_seconds: 60,
+            cache_max_age_seconds: 30,
+            filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_and_reserved_calendar_slugs() {
+        let duplicate = Config {
+            listen_address: "127.0.0.1:8080".parse().unwrap(),
+            calendars: vec![calendar_config("work"), calendar_config("work")],
+        };
+        assert!(validate_config(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate calendar slug"));
+
+        let reserved = Config {
+            listen_address: "127.0.0.1:8080".parse().unwrap(),
+            calendars: vec![calendar_config("health")],
+        };
+        assert!(validate_config(&reserved)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid calendar slug"));
+    }
+
+    fn app_state(failures: &[(&str, Option<&str>)]) -> Arc<AppState> {
+        let calendars = failures
+            .iter()
+            .map(|(slug, error)| {
+                (
+                    (*slug).to_owned(),
+                    Arc::new(CalendarState {
+                        snapshot: RwLock::new(None),
+                        cache_control: HeaderValue::from_static("public, max-age=60"),
+                        last_error: RwLock::new(error.map(str::to_owned)),
+                    }),
+                )
+            })
+            .collect();
+        Arc::new(AppState {
+            calendars,
+            started_at: Instant::now(),
+        })
+    }
+
+    #[tokio::test]
+    async fn health_reports_healthy_calendars() {
+        let (status, Json(payload)) = health(State(app_state(&[("work", None)]))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload.status, "200 OK");
+        assert!(payload.failed_calendars.is_empty());
+        assert!(payload.uptime >= 0.0);
+        assert!(chrono::DateTime::parse_from_rfc3339(&payload.date).is_ok());
+    }
+
+    #[tokio::test]
+    async fn health_reports_failed_calendars_as_bad_gateway() {
+        let (status, Json(payload)) = health(State(app_state(&[
+            ("work", Some("upstream timed out")),
+            ("personal", None),
+        ])))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(payload.status, "502 Bad Gateway");
+        assert_eq!(payload.failed_calendars.len(), 1);
+        assert_eq!(payload.failed_calendars[0].slug, "work");
+        assert_eq!(payload.failed_calendars[0].error, "upstream timed out");
+    }
+
+    #[tokio::test]
+    async fn calendar_route_requires_a_known_initialized_slug() {
+        let state = app_state(&[("work", None)]);
+        let response = calendar(
+            Path("work.ics".to_owned()),
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let response = calendar(
+            Path("missing.ics".to_owned()),
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        *state.calendars["work"].snapshot.write().await = Some(Snapshot {
+            body: Bytes::from_static(b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"),
+            etag: HeaderValue::from_static("\"test\""),
+        });
+        let response = calendar(Path("work.ics".to_owned()), State(state), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

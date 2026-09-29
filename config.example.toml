@@ -1,15 +1,24 @@
-# Copy to config.toml and replace source_url with the private feed URL.
-source_url = "https://calendar.example.com/private-feed.ics"
 listen_address = "0.0.0.0:8080"
+
+[[calendars]]
+slug = "my-cal"
+source_url = "https://calendar.example.com/private-feed.ics"
 refresh_seconds = 300
 cache_max_age_seconds = 60
 
 # Rules are applied in order. The last matching rule wins; events without a
 # SUMMARY are retained. Rust regular expressions support inline flags, e.g. (?i).
-[[filters]]
+[[calendars.filters]]
 pattern = "(?i)standup|focus time"
 action = "exclude"
 
-[[filters]]
+[[calendars.filters]]
 pattern = "(?i)^project alpha"
 action = "include"
+
+[[calendars]]
+slug = "work"
+source_url = "https://calendar.example.com/work.ics"
+refresh_seconds = 60
+cache_max_age_seconds = 30
+filters = []
