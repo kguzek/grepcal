@@ -27,6 +27,8 @@ use tokio::{sync::RwLock, time};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
+mod landing;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -143,6 +145,7 @@ async fn main() -> Result<()> {
     });
 
     let app = Router::new()
+        .route("/", get(landing::home))
         .route("/{calendar}", get(calendar))
         .route("/health", get(health))
         .with_state(state)
@@ -512,5 +515,14 @@ mod tests {
         });
         let response = calendar(Path("work.ics".to_owned()), State(state), HeaderMap::new()).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn home_includes_build_metadata() {
+        let page = landing::home().await.0;
+
+        assert!(page.contains("Like grep, but for iCal!"));
+        assert!(page.contains("https://git.guzek.uk/kguzek/grepcal"));
+        assert!(page.contains(env!("GREPCAL_REVISION")));
     }
 }
