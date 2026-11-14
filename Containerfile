@@ -1,4 +1,4 @@
-FROM rust:1.97-alpine3.21 AS builder
+FROM rust:1.100-alpine3.21 AS builder
 
 ARG GREPCAL_REVISION
 
