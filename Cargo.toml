@@ -10,7 +10,7 @@ bytes = "1.9.0"
 chrono = { version = "0.4.39", default-features = false, features = ["clock", "std"] }
 ical = "0.11.0"
 regex = "1.11.1"
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.0", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0.217", features = ["derive"] }
 sha2 = "0.10.8"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
