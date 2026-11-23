@@ -87,7 +87,8 @@ async fn fetch_snapshot(client: &Client, source_url: &str, filters: &[Filter]) -
         .bytes()
         .await?;
     let body = filter_calendar(&source, filters)?;
-    let etag = format!("\"{:x}\"", Sha256::digest(&body));
+    let digest = Sha256::digest(&body);
+    let etag = format!("\"{:x}\"", Bytes::copy_from_slice(&digest));
     Ok(Snapshot {
         body: Bytes::from(body),
         etag: HeaderValue::from_str(&etag)?,
